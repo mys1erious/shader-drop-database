@@ -1,0 +1,634 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Drop database</title>
+<meta name="description" content="Hold the button and a production database terminal melts into embers. Let go and it heals.">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/ibm-plex-mono@5.2.7/500.css">
+<style>
+html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none; }
+#gl { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+button { position: fixed; font: 500 14px 'IBM Plex Mono', ui-monospace, Menlo, monospace; color: #7dffa8; background: none; border: 0;
+  border-radius: 4px; cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent; }
+button:focus { outline: none; }
+button:focus-visible { outline: 2px solid #eafff1; outline-offset: 3px; }
+#hold { color: transparent; }
+#again { display: none; left: 50%; transform: translateX(-50%); padding: 12px 18px; border: 1px solid #2f6b47; touch-action: manipulation; white-space: nowrap; }
+#cur { position: fixed; left: 0; top: 0; width: clamp(20px, 3.4vmin, 34px); height: auto; transform-origin: 0 0; display: none; pointer-events: none; filter: drop-shadow(0 2px 5px #000); }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+</style>
+</head>
+<body>
+<canvas id="gl" role="img" aria-label="A terminal showing a fictional production database session"></canvas>
+<button id="hold" aria-label="Hold to drop the fictional database. Mouse, touch, or hold Space. Let go to cool it.">Hold to drop database</button>
+<button id="again">Restore from backup</button>
+<svg id="cur" width="34" height="50" viewBox="0 0 13 19" aria-hidden="true"><path d="M1 1v15l4-4 3 6 2.5-1-3-6h6z" fill="#fff" stroke="#000" stroke-width="1.2" stroke-linejoin="round"/></svg>
+<p id="say" class="sr" aria-live="polite"></p>
+
+<script>
+const Q = new URLSearchParams(location.search);
+const CLEAN = Q.has('clean'), FREEZE = Q.has('t') ? Math.max(0, parseFloat(Q.get('t')) || 0) : null;
+const PLAY = Q.has('play') || FREEZE !== null;
+const CALM = matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 1;
+
+const HOLD_S = 6, COOL_S = 2.4;          // seconds to the end of a full hold, seconds for the hold bar to fall back
+const SCRIPT = [[0.08, 3.3], [6.5, 99]]; // ?play: press and release times; the second hold runs to the end
+const T_OFF = 2.9, T_TYPE = 3.7;         // after the hold ends: tube dies, last line starts typing
+const ROWS = 20622650;                   // 18,204,557 invoices + 2,418,093 customers, as printed in the session
+const COLD = '#8dffb4', DIM = '#4fbf7c', BRIGHT = '#d8ffe6', WARM = '#e8421a';
+
+const canvas = document.getElementById('gl'), holdBtn = document.getElementById('hold'), again = document.getElementById('again');
+const cur = document.getElementById('cur'), say = document.getElementById('say');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, preserveDrawingBuffer: PLAY });
+if (!gl) { document.body.innerHTML = '<p style="color:#7dffa8;font:16px monospace;padding:16px">This one needs WebGL2.</p>'; throw new Error('no webgl2'); }
+const FLOAT_OK = gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float');
+gl.getExtension('OES_texture_float_linear');
+// shortcut: 8-bit fallback clips the heat range and cap, fine for the rare GPU with no float targets
+const FMT = FLOAT_OK ? [gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT] : [gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE];
+
+function mulberry(a) { return () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+/* ---------- shaders ---------- */
+const VS = `#version 300 es
+out vec2 vUv; void main(){ vec2 p=vec2(gl_VertexID&1,gl_VertexID>>1); vUv=p; gl_Position=vec4(p*2.-1.,0,1); }`;
+const NOISE = `
+float h1(float x){ return fract(sin(x*127.1+3.7)*43758.5453); }
+float h2(vec2 p){ vec3 q=fract(vec3(p.xyx)*.1031); q+=dot(q,q.yzx+33.33); return fract((q.x+q.y)*q.z); }
+float n1(float x){ float i=floor(x),f=fract(x); f=f*f*(3.-2.*f); return mix(h1(i),h1(i+1.),f); }
+float n2(vec2 p){ vec2 i=floor(p),f=fract(p); f=f*f*(3.-2.*f);
+  return mix(mix(h2(i),h2(i+vec2(1,0)),f.x),mix(h2(i+vec2(0,1)),h2(i+vec2(1,1)),f.x),f.y); }
+float fbm(vec2 p){ return .55*n2(p)+.3*n2(p*2.1+7.)+.15*n2(p*4.3+13.); }`;
+const HEAT_FRONT = `
+// seeds: x, y, delay in front units. Same numbers as SEEDS in the JS, which uses this to place embers.
+float front(vec2 uv,float P,float asp,float n){
+  vec2 p=vec2(uv.x*asp,uv.y);
+  float d=length(p-vec2(.5*asp,.80));
+  d=min(d,length(p-vec2(.16*asp,.66))+.10);
+  d=min(d,length(p-vec2(.84*asp,.70))+.14);
+  float R=pow(P,.8)*1.5+.1;
+  return smoothstep(0.,.10,R-d-n*.32);
+}`;
+
+// all the noise the sim needs is fixed in space, so it is baked once: phones can't afford it per cell per substep
+// r lane speed, g sideways pull at this cell's right face, b heat-front noise, a coating blotches
+const FIELD = `#version 300 es
+precision highp float;
+uniform float uAsp,uLane; in vec2 vUv; out vec4 o;
+${NOISE}
+float lanes(vec2 c){ // each stretch wanders on its own, and some stretches run thick while others barely move
+  float warp=(n2(vec2(c.x/(uLane*2.5),c.y/150.))-.5)*1.25;
+  return n1(c.x/uLane+warp)*(.35+.9*n1(c.x/(uLane*4.3)+7.));
+}
+void main(){
+  vec2 c=gl_FragCoord.xy, p=vUv*vec2(uAsp,1.);
+  float d=lanes(c+vec2(2.,0))-lanes(c-vec2(1.,0));
+  o=vec4(lanes(c),clamp(-d*1.6,-.14,.14),fbm(p*4.),fbm(p*7.));
+}`;
+
+// state: r liquid phosphor, g heat, b how much of the original glyph is still solid, a afterglow of hot liquid
+const SIM = `#version 300 es
+precision highp float;
+uniform sampler2D uS,uText,uField; uniform vec2 uRes; uniform vec4 uBtn,uFlare;
+uniform float uP,uHeat,uGrav,uDone,uOpen,uWipe,uAsp,uLod,uDt;
+in vec2 vUv; out vec4 o;
+${NOISE}${HEAT_FRONT}
+const float CAP=1.5; // fall .62 + two sides .14+.05 stays under 1: a cell may never give away more than it holds, or clamping creates mass
+float fluid(float T){ return smoothstep(.22,.62,T); }
+float fall(vec4 a,vec4 b,float w){ // top cell a, bottom cell b; each side computes the same face flux, so mass is conserved
+  if(uGrav<=0.) return 0.;
+  float t=min(a.r/.75,1.);
+  float v=(.05+.95*t*t)*(.1+.9*w*w)*max(fluid(a.g),uOpen)*(.7+uOpen*2.);
+  return min(a.r*min(v,.62),max(0.,CAP-b.r));
+}
+float rise(vec4 a){ return uGrav>=0.?0.:a.r*(.14+.3*min(a.r,1.)); }
+float side(vec4 a,vec4 b,float pull){ // left a, right b; lanes pull liquid into rivulets, thick pools level out
+  float u=pull*fluid(max(a.g,b.g))*step(0.,uGrav);
+  float lv=.05*(a.r-b.r)*step(.9,max(a.r,b.r))*step(0.,uGrav);
+  return (u>0.?a.r*u:b.r*u)+lv;
+}
+void main(){
+  vec2 px=1./uRes, c=gl_FragCoord.xy;
+  vec4 s=texture(uS,vUv), U=texture(uS,vUv+vec2(0,px.y)), D=texture(uS,vUv-vec2(0,px.y));
+  vec4 W=texture(uS,vUv-vec2(px.x,0)), E=texture(uS,vUv+vec2(px.x,0));
+  bool top=c.y>uRes.y-1., bot=c.y<1., lft=c.x<1., rgt=c.x>uRes.x-1.;
+  float L=s.r,T=s.g,S=s.b;
+  vec4 F=texture(uField,vUv), FU=texture(uField,vUv+vec2(0,px.y)), FW=texture(uField,vUv-vec2(px.x,0));
+  if(!top){ L+=fall(U,s,FU.r); L-=rise(s); }
+  if(!bot){ L-=fall(s,D,F.r); L+=rise(D); } else if(uOpen>0.) L-=L*min(.9,.9*uOpen);
+  if(!lft) L+=side(W,s,FW.g);
+  if(!rgt) L-=side(s,E,F.g);
+  L=max(L,0.);
+
+  vec3 tx=textureLod(uText,vUv,uLod).rgb; float h0=max(tx.r,max(tx.g,tx.b));
+  bool inBtn=all(greaterThan(vUv,uBtn.xy))&&all(lessThan(vUv,uBtn.zw));
+  bool safe=inBtn&&uDone<.5;
+
+  // heat: the front from the hold, the hot liquid itself, and whatever just ran down from above
+  float tgt=front(vUv,uP,uAsp,F.b)*uHeat;
+  tgt=max(tgt,uHeat*.9*smoothstep(.015,.2,L));
+  tgt=max(tgt,uHeat*.98*U.g*smoothstep(.015,.25,U.r));
+  tgt=max(tgt,uHeat*.2*step(uFlare.x,vUv.y)*step(vUv.y,uFlare.y)); // the command line warms the instant you press
+  if(uDone>.5) tgt=max(tgt,.95*(1.-smoothstep(1.2,2.8,uDone)));
+  if(uOpen>0.) tgt*=1.-smoothstep(.5,1.,uOpen)*.5;
+  T=mix(T,tgt,(tgt>T?.16:(uHeat>.5?.03:.075))*uDt);
+  if(safe) T=min(T,.3);
+
+  // melt: noise makes glyphs erode instead of fading evenly
+  float melt=smoothstep(.40,.58,T+(n2(c*.31)-.5)*.34);
+  float dS=min(S,melt*.045*uDt);
+  S-=dS; L+=dS*h0*.62;
+  // late in the hold the phosphor coating itself lets go, in blotches, so it is the screen melting and not only the text
+  L+=max(F.a-.34,0.)*.0034*smoothstep(.55,1.,uP)*smoothstep(.5,.8,T)*uHeat*uDt;
+
+  // heal: cold liquid soaks back into its letters; the rest fades so the screen always ends up clean
+  if(uHeat<.5&&uDone<.5&&T<.32){
+    float a=min(L,(1.-S)*h0*.3*uDt);
+    S+=a/max(h0,.06); L-=a;
+    S=min(1.,S+.0052*(.3+1.4*F.a)*uDt*step(uGrav,-.01));
+    L*=1.-.0065*uDt*step(uGrav,-.01);
+  }
+    float G=max(s.a*(1.-.018*uDt),min(1.,L*2.)*smoothstep(.3,.8,T));
+  G*=uHeat>.5||uDone>.5?1.:1.-.09*uDt;
+  // the end: a ragged edge sweeps down the glass and leaves nothing behind it
+  float wipe=uWipe>0.?smoothstep(0.,.05,vUv.y-(1.08-uWipe*1.3+(fbm(vec2(vUv.x*uAsp*5.,3.))-.5)*.2)):0.;
+  L*=1.-.14*wipe*uDt; G*=1.-.14*wipe*uDt; T*=1.-.05*wipe*uDt;
+  o=vec4(L,T,S,G);
+}`;
+
+const SCENE = `#version 300 es
+precision highp float;
+uniform sampler2D uS,uText; uniform vec2 uRes,uSimRes; uniform vec4 uBtn;
+uniform float uTime,uP,uPower,uEnd,uDone,uCalm,uFill;
+in vec2 vUv; out vec4 o;
+${NOISE}
+vec3 fire(float x){ // incandescence: dull red, orange, yellow, white
+  vec3 a=vec3(.2,.012,.004),b=vec3(1.05,.17,.012),c=vec3(2.1,.8,.08),d=vec3(4.2,2.9,1.3);
+  x=clamp(x,0.,1.);
+  return x<.34?mix(a,b,x/.34):x<.68?mix(b,c,(x-.34)/.34):mix(c,d,(x-.68)/.32);
+}
+void main(){
+  vec2 uv=vUv;
+  float hz=texture(uS,uv).g*uCalm;
+  uv+=(vec2(n2(uv*vec2(44.,30.)+vec2(0.,uTime*2.6)),n2(uv*vec2(38.,26.)+vec2(5.,uTime*2.2)))-.5)*.0075*hz;
+  vec4 s=texture(uS,uv);
+  float L=s.r,T=s.g,S=s.b,G=s.a;
+  vec3 tx=texture(uText,uv).rgb; tx*=tx;
+  float m=max(tx.r,max(tx.g,tx.b));
+  bool inBtn=all(greaterThan(uv,uBtn.xy))&&all(lessThan(uv,uBtn.zw));
+
+  // raster glow of a live tube, and its dark glass once dead
+  vec2 q=vUv-.5;
+  vec3 col=vec3(.0035,.011,.0075)*(1.-dot(q,q)*1.3)*uPower*(1.-.9*uP);
+  col+=vec3(.012,.002,.0004)*T*T*uPower;
+
+  if(uEnd>.5){ o=vec4(col+tx*1.5,0.); return; }
+  float ink=0.; // label pixels: FINAL keeps bloom off them, or the hot fill washes the numbers out
+
+  // solid glyphs: brighten, then go incandescent as they near melting
+  float Se=smoothstep(.08,.62,S);
+  float hot=smoothstep(.1,.42,T);
+  vec3 glyph=mix(tx*(1.+T*3.),m*fire(.26+T*.4),hot);
+  if(inBtn){ // the fill sweeps the block from cold red to white-hot
+    float f=step(uv.x,mix(uBtn.x,uBtn.z,uFill)), lbl=1.-smoothstep(.05,.35,m);
+    glyph=mix(mix(vec3(.62,.05,.012),vec3(1.5,1.2,.95),lbl),mix(fire(.56),vec3(.012,.003,0.),lbl),f);
+    ink=lbl*f*smoothstep(.1,.5,S);
+  }
+  col+=glyph*Se;
+
+  // liquid: thresholded so it reads as a surface; normal from thickness gives the wet highlight
+  vec2 px=1./uSimRes;
+  float l1=texture(uS,uv+vec2(px.x,0)).r,l2=texture(uS,uv-vec2(px.x,0)).r,l3=texture(uS,uv+vec2(0,px.y)).r,l4=texture(uS,uv-vec2(0,px.y)).r;
+  float Lb=(L*2.+l1+l2+l3+l4)/6.;
+  float mask=smoothstep(.07,.15,Lb);
+  vec3 n=normalize(vec3((l2-l1)*5.,(l4-l3)*5.,1.));
+  float spec=pow(max(dot(n,normalize(vec3(-.5,.6,.62))),0.),22.);
+  float inc=T*(.1+.5*pow(min(Lb,1.5),1.25));
+  float hl=uDone>.5?1.:smoothstep(.1,.36,T);
+  vec3 liq=mix(vec3(.16,.95,.42)*(.3+.9*min(Lb,1.)),fire(inc),hl);
+  if(inBtn&&uDone<.5) mask*=.25;
+  col=mix(col,liq*uPower,mask*.92);
+  col+=mask*spec*mix(vec3(.45,1.,.65),vec3(4.,2.6,1.1),hl)*.7*uPower;
+
+  // afterglow left on the glass where hot liquid ran
+  col+=fire(.05+G*.2)*G*.13*(1.-mask)*uPower;
+  o=vec4(col,ink);
+}`;
+
+const EMBER_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec4 aA; layout(location=1) in vec2 aB;
+uniform vec2 uRes; out vec2 vQ; out float vLife;
+void main(){
+  vec2 c=vec2(gl_VertexID&1,gl_VertexID>>1)*2.-1.;
+  vec2 v=aA.zw*uRes; float sp=length(v);
+  vec2 d=sp>1.?v/sp:vec2(0,1), e=vec2(-d.y,d.x);
+  float len=aB.y*(1.+min(sp*.012,3.2));
+  vec2 p=aA.xy*uRes+(d*c.y*len+e*c.x*aB.y);
+  vQ=c; vLife=aB.x;
+  gl_Position=vec4(p/uRes*2.-1.,0,1);
+}`;
+const EMBER_FS = `#version 300 es
+precision highp float;
+in vec2 vQ; in float vLife; out vec4 o;
+void main(){
+  float g=exp(-dot(vQ,vQ)*3.2);
+  float x=clamp(vLife,0.,1.);
+  vec3 c=mix(vec3(.9,.05,.01),mix(vec3(2.2,.5,.05),vec3(4.5,2.6,.8),smoothstep(.72,1.,x)),smoothstep(.05,.5,x));
+  o=vec4(c*g*smoothstep(0.,.14,x),0.); // alpha 0: scene alpha is the label's no-bloom mask
+}`;
+
+const BLUR = `#version 300 es
+precision highp float;
+uniform sampler2D uT; uniform vec2 uPx; uniform float uKnee; in vec2 vUv; out vec4 o;
+void main(){
+  vec3 c=texture(uT,vUv+uPx*vec2(-1,-1)).rgb+texture(uT,vUv+uPx*vec2(1,-1)).rgb+texture(uT,vUv+uPx*vec2(-1,1)).rgb+texture(uT,vUv+uPx*vec2(1,1)).rgb;
+  c*=.25;
+  if(uKnee>0.) c=min(c,vec3(8.))*smoothstep(.25,uKnee,max(c.r,max(c.g,c.b)));
+  o=vec4(c,1.);
+}`;
+
+const FINAL = `#version 300 es
+precision highp float;
+uniform sampler2D uScene,uBloom; uniform vec2 uRes; uniform float uTime,uPower,uLine,uCalm,uDpr;
+in vec2 vUv; out vec4 o;
+${NOISE}
+void main(){
+  vec2 p=(vUv*2.-1.)*.992, asp=vec2(uRes.x/uRes.y,1.);
+  float r2=dot(p*asp/max(asp.x,1.),p*asp/max(asp.x,1.));
+  vec2 q=p*(1.+.022*r2);
+  vec2 uv=q*.5+.5;
+  // tube collapse: the picture squeezes to a line, then the line dies
+  float sq=1.+uLine*uLine*160.;
+  uv.y=(uv.y-.5)*sq+.5;
+  vec2 ca=(uv-.5)*.0016*r2;
+  vec3 c=vec3(texture(uScene,uv+ca).r,texture(uScene,uv).g,texture(uScene,uv-ca).b);
+  c+=texture(uBloom,uv).rgb*.42*(1.-texture(uScene,uv).a*.92);
+  float line=uLine>0.?exp(-abs(vUv.y-.5)*uRes.y*(.14+uLine*.1))*smoothstep(1.,.62,uLine)*(1.-pow(abs(vUv.x-.5)*2.,3.)*min(uLine*1.3,1.)):0.;
+  c+=vec3(.8,1.,.9)*line*5.;
+
+  // scanlines and phosphor triads, sized in CSS pixels so phones keep the same grain
+  float y=gl_FragCoord.y/uDpr;
+  float sl=.86+.14*sin(y*2.094);
+  c*=mix(1.,sl,uPower*.9+.1);
+  float flick=1.+.012*sin(uTime*47.)*uCalm*uPower;
+  c*=flick;
+
+  // curved glass edge
+  vec2 e=abs(q)-vec2(1.);
+  float mask=smoothstep(.012,-.006,max(e.x,e.y)+.0);
+  vec2 cq=max(abs(q)-(1.-.06),0.); mask*=smoothstep(.06,.05,length(cq));
+  float vig=1.-.26*r2;
+  c*=mask*vig;
+  c=1.-exp(-c*1.25);
+  c=pow(c,vec3(.4545));
+  c=mix(c,c*c*(3.-2.*c),.45);
+  c+=(h2(gl_FragCoord.xy+fract(uTime)*91.)-.5)*.012;
+  o=vec4(c,1.);
+}`;
+
+function prog(fs, vs = VS) {
+  const p = gl.createProgram();
+  for (const [t, src] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+    const s = gl.createShader(t); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    gl.attachShader(p, s);
+  }
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const a = gl.getActiveUniform(p, i); u[a.name] = gl.getUniformLocation(p, a.name); }
+  return { p, u };
+}
+const P_FIELD = prog(FIELD), P_SIM = prog(SIM), P_SCENE = prog(SCENE), P_EMBER = prog(EMBER_FS, EMBER_VS), P_BLUR = prog(BLUR), P_FINAL = prog(FINAL);
+const vao = gl.createVertexArray();
+
+function target(w, h) {
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, FMT[0], w, h, 0, FMT[1], FMT[2], null);
+  for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+  const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return { tex, fb, w, h };
+}
+const free = (t) => { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); };
+function bind(unit, tex, loc) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(loc, unit); }
+function quad(t) { gl.bindFramebuffer(gl.FRAMEBUFFER, t ? t.fb : null); gl.viewport(0, 0, t ? t.w : PW, t ? t.h : PH); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); }
+
+/* ---------- the terminal text ---------- */
+const CUSTOMERS = ['Tallow & Finch', 'Ashgrove Mills', 'Soot & Sons', 'Cinder Row Books', 'Wick St Foundry', 'Bellows Marine', 'Clinker & Vane',
+  'Flint Harbor Cold', 'Slag Hill Quarry', 'Hearthmoor Dairy', 'Pyre Valley Wool', 'Scorch Point Salt', 'Lantern Bay Ferry', 'Charcoal Lane Tea'];
+const EXTRA = [['region', 7], ['terms', 6], ['po_ref', 9], ['due', 11], ['owner', 9], ['currency', 9], ['tax', 7], ['batch', 8]];
+const TOP = ['mothwick-sql 4.2 / db-prod-01 / read-write', 'uptime 1,412 days   role admin   replicas 3', ''];
+const BOTTOM = ['(18,204,557 rows)', '', 'prod> SELECT count(*) FROM customers;', '2,418,093', 'prod> SHOW BACKUPS;', 'last full backup: ask Dennis', 'prod> DROP DATABASE mothwick_prod;'];
+
+const text = document.createElement('canvas'), tctx = text.getContext('2d', { willReadFrequently: true });
+const label = document.createElement('canvas'), lctx = label.getContext('2d');
+let W, H, PW, PH, dpr, font, lineH, charW, gutter, btn, flare, glyphs, textTex, simA, simB, field, scene, chain, simW, simH, SUB, lastLabel;
+
+function pad(s, n, right) { s = String(s).slice(0, n); return right ? s.padStart(n) : s.padEnd(n); }
+function tableLines(cols, n) {
+  const r = mulberry(1412), rows = [];
+  const fields = [['invoice', 8], ['customer', 17], ['amount', 9, 1], ['st', 4]];
+  let used = 8 + 2 + 17 + 2 + 9 + 2 + 4;
+  for (const f of EXTRA) if (used + 2 + f[1] <= cols) { fields.push(f); used += 2 + f[1]; }
+  rows.push(fields.map(f => pad(f[0], f[1], f[2])).join('  '));
+  rows.push(fields.map(f => '-'.repeat(f[1])).join('  '));
+  for (let i = 0; i < n; i++) {
+    const v = { invoice: 18204557 - i * 3 - Math.floor(r() * 3), customer: CUSTOMERS[Math.floor(r() * CUSTOMERS.length)], amount: (r() * 9000 + 40).toFixed(2),
+      st: r() < .78 ? 'paid' : r() < .7 ? 'late' : 'void', region: ['north', 'south', 'east', 'west'][Math.floor(r() * 4)], terms: 'net' + [15, 30, 60][Math.floor(r() * 3)],
+      po_ref: 'PO-' + Math.floor(r() * 90000 + 10000), due: '2026-' + String(Math.floor(r() * 2) + 11).padStart(2, '0') + '-' + String(Math.floor(r() * 28) + 1).padStart(2, '0'),
+      owner: ['ops', 'billing', 'finance', 'sales'][Math.floor(r() * 4)], currency: 'EUR', tax: (r() * 22).toFixed(1) + '%', batch: 'B' + Math.floor(r() * 9000 + 1000) };
+    rows.push(fields.map(f => pad(v[f[0]], f[1], f[2])).join('  '));
+  }
+  return rows;
+}
+
+function drawTerminal() {
+  tctx.setTransform(1, 0, 0, 1, 0, 0);
+  tctx.fillStyle = '#000'; tctx.fillRect(0, 0, PW, PH);
+  tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  tctx.font = `500 ${font}px 'IBM Plex Mono', ui-monospace, Menlo, monospace`;
+  tctx.textBaseline = 'top';
+  const cols = Math.floor((W - 2 * gutter) / charW);
+  const rows = Math.floor((btn.y - gutter - lineH * .7) / lineH);
+  const n = Math.max(0, rows - TOP.length - BOTTOM.length - 3);
+  const lines = [...TOP, 'prod> SELECT * FROM invoices ORDER BY id DESC;', ...tableLines(cols, n), ...BOTTOM].slice(-rows);
+  lines.forEach((s, i) => {
+    const y = gutter + (rows - lines.length + i) * lineH;
+    tctx.fillStyle = s.startsWith('prod>') ? BRIGHT : s.startsWith('---') || i < 2 ? DIM : COLD;
+    if (s.startsWith('prod> DROP')) { flare = [1 - (y + lineH) / H, 1 - y / H]; tctx.fillStyle = '#fff'; tctx.fillRect(gutter + (s.length + .3) * charW, y + lineH * .08, charW * .92, lineH * .84); tctx.fillStyle = BRIGHT; }
+    tctx.fillText(s, gutter, y + (lineH - font) / 2);
+  });
+  if (!CLEAN) {
+    tctx.fillStyle = DIM; tctx.textAlign = 'center';
+    tctx.font = `500 ${Math.max(11, font * .82)}px 'IBM Plex Mono', ui-monospace, Menlo, monospace`;
+    tctx.fillText('mouse, touch or space. let go to cool it.', W / 2, btn.y + btn.h + Math.max(6, (H - btn.y - btn.h - font) / 2 - 2));
+    tctx.textAlign = 'left';
+  }
+}
+
+function drawLabel(s) {
+  if (s === lastLabel) return; lastLabel = s;
+  const w = Math.round(btn.w * dpr), h = Math.round(btn.h * dpr);
+  if (label.width !== w || label.height !== h) { label.width = w; label.height = h; }
+  lctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  lctx.fillStyle = WARM; lctx.fillRect(0, 0, btn.w, btn.h);
+  lctx.fillStyle = '#0a0300'; lctx.textAlign = 'center'; lctx.textBaseline = 'middle';
+  lctx.font = `500 ${Math.min(font * 1.2, btn.h * .4, btn.w / s.length / .64)}px 'IBM Plex Mono', ui-monospace, Menlo, monospace`;
+  lctx.fillText(s, btn.w / 2, btn.h / 2 + 1);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, textTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, Math.round(btn.x * dpr), PH - Math.round(btn.y * dpr) - h, gl.RGBA, gl.UNSIGNED_BYTE, label);
+}
+
+function uploadText() {
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, textTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, text);
+  gl.generateMipmap(gl.TEXTURE_2D);
+}
+
+function setup() {
+  W = innerWidth; H = innerHeight; dpr = Math.min(devicePixelRatio || 1, 2);
+  PW = Math.round(W * dpr); PH = Math.round(H * dpr);
+  canvas.width = PW; canvas.height = PH; text.width = PW; text.height = PH;
+  gutter = Math.max(16, Math.round(Math.min(W, H) * .04));
+  font = Math.max(11, Math.min((W - 2 * gutter) / (46 * .6), (H - 2 * gutter) / (31 * 1.34), 34));
+  lineH = Math.round(font * 1.34 * dpr) / dpr;
+  tctx.font = `500 ${font}px 'IBM Plex Mono', ui-monospace, Menlo, monospace`;
+  charW = tctx.measureText('0').width;
+  const bw = Math.min(W - 2 * gutter, font * 34), bh = Math.max(56, font * 3.1);
+  const under = CLEAN ? gutter * 1.2 : Math.max(gutter * 1.4, font * 3);
+  btn = { x: Math.round((W - bw) / 2), y: Math.round(H - bh - under), w: Math.round(bw), h: Math.round(bh) };
+  Object.assign(holdBtn.style, { left: btn.x + 'px', top: btn.y + 'px', width: btn.w + 'px', height: btn.h + 'px' });
+  again.style.top = Math.round(H * .56) + 'px';
+
+  for (const t of [simA, simB, field, scene, ...(chain || [])]) if (t) free(t);
+  const k = Math.max(1, Math.max(PW / 1024, PH / 1024, 2 * dpr / 2));
+  simW = Math.round(PW / k); simH = Math.round(PH / k);
+  SUB = Math.max(2, Math.min(5, Math.round(simH / 200)));
+  simA = target(simW, simH); simB = target(simW, simH); field = target(simW, simH); scene = target(PW, PH);
+  gl.useProgram(P_FIELD.p); gl.bindVertexArray(vao); gl.uniform1f(P_FIELD.u.uAsp, W / H); gl.uniform1f(P_FIELD.u.uLane, charW * dpr * (simW / PW) * 1.8);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, field.fb); gl.viewport(0, 0, simW, simH); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  chain = []; for (let i = 1, w = PW, h = PH; i <= 6; i++) { w = Math.max(2, w >> 1); h = Math.max(2, h >> 1); chain.push(target(w, h)); }
+
+  if (!textTex) textTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, textTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  embersBuf = new Float32Array(MAX_E * 6);
+  reset();
+}
+
+/* ---------- state ---------- */
+let P, held, done, doneAt, t, heldTotal, releasedAt, ended, rng, typed, wasHeld;
+const MAX_E = 1600, ember = []; let embersBuf;
+const ebo = gl.createBuffer(), evao = gl.createVertexArray();
+gl.bindVertexArray(evao); gl.bindBuffer(gl.ARRAY_BUFFER, ebo);
+gl.enableVertexAttribArray(0); gl.enableVertexAttribArray(1);
+gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 24, 0); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 24, 16);
+gl.vertexAttribDivisor(0, 1); gl.vertexAttribDivisor(1, 1);
+gl.bindVertexArray(vao);
+
+function reset() {
+  P = 0; held = false; done = false; doneAt = 0; t = 0; heldTotal = 0; releasedAt = -9; ended = false; typed = -1; wasHeld = false; lastLabel = null;
+  rng = mulberry(20261105); ember.length = 0;
+  drawTerminal();
+  // where the letters are, so embers leave real glyphs rather than empty glass
+  glyphs = []; const step = Math.max(2, Math.round(3 * dpr)), d = tctx.getImageData(0, 0, PW, PH).data;
+  for (let y = 0; y < PH; y += step) for (let x = 0; x < PW; x += step) if (d[(y * PW + x) * 4 + 1] > 90) glyphs.push(x / PW, 1 - y / PH);
+  uploadText(); drawLabel('HOLD TO DROP DATABASE');
+  for (const s of [simA, simB]) { gl.bindFramebuffer(gl.FRAMEBUFFER, s.fb); gl.clearColor(0, 0, 1, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
+  again.style.display = 'none'; holdBtn.style.display = 'block'; say.textContent = '';
+}
+
+const SEEDS = [[.5, .80, 0], [.16, .66, .10], [.84, .70, .14]];
+function frontCPU(x, y) { // the smooth part of front() in the SIM shader
+  const asp = W / H, R = Math.pow(P, .8) * 1.5 + .1;
+  let d = 9; for (const [sx, sy, o] of SEEDS) d = Math.min(d, Math.hypot((x - sx) * asp, y - sy) + o);
+  return R - d - .16;
+}
+
+function spawn(x, y, up, burst) {
+  if (ember.length >= MAX_E) return;
+  const s = (.0009 + Math.pow(rng(), 3) * .003) * Math.max(1, 900 / Math.max(W, H));
+  ember.push({ x, y, vx: (rng() - .5) * .05, vy: up ? .09 + rng() * .2 : -.03 - rng() * .1 - burst * .25, up, life: 1, die: .4 + rng() * (up ? .7 : .55), size: s * Math.max(W, H) * dpr, ph: rng() * 6.28 });
+}
+
+function stepEmbers(dt) {
+  const hot = held || (done && t - doneAt < 1.9);
+  if (hot) {
+    const n = done ? 8 : 1 + Math.floor(P * 9 + rng());
+    for (let i = 0; i < n; i++) {
+      const g = Math.floor(rng() * glyphs.length / 2) * 2, x = glyphs[g], y = glyphs[g + 1];
+      if (done || frontCPU(x, y) > 0) spawn(x, y, rng() < .22, done ? 1 : 0);
+    }
+  }
+  for (let i = ember.length - 1; i >= 0; i--) {
+    const e = ember[i];
+    e.ph += dt * 3;
+    e.vx += (Math.sin(e.y * 11 + e.ph) * .22 + Math.sin(e.x * 17 + e.ph * .6) * .12) * dt;
+    e.vy += (e.up ? .05 : -.62) * dt;
+    e.vx *= 1 - .9 * dt; e.vy *= 1 - (e.up ? .9 : .28) * dt;
+    e.x += e.vx * dt; e.y += e.vy * dt;
+    e.life -= dt / e.die / 2;
+    if (e.life <= 0 || e.y < -.02) ember.splice(i, 1);
+  }
+}
+
+function simStep() {
+  const since = t - releasedAt;
+  const heat = held || (done && t - doneAt < 1.6) ? 1 : 0;
+  const grav = held || done ? 1 : since < .45 ? 1 : -1;
+  const doneS = done ? t - doneAt + .001 : 0;
+  gl.useProgram(P_SIM.p); const u = P_SIM.u;
+  gl.bindVertexArray(vao); gl.disable(gl.BLEND);
+  gl.uniform2f(u.uRes, simW, simH);
+  gl.uniform4f(u.uBtn, btn.x / W, 1 - (btn.y + btn.h) / H, (btn.x + btn.w) / W, 1 - btn.y / H);
+  gl.uniform4f(u.uFlare, flare[0], flare[1], 0, 0);
+  gl.uniform1f(u.uP, P); gl.uniform1f(u.uHeat, heat); gl.uniform1f(u.uGrav, grav); gl.uniform1f(u.uDone, doneS);
+  gl.uniform1f(u.uOpen, done ? Math.min(1, Math.max(0, (doneS - .35) / 1.1)) : 0);
+  gl.uniform1f(u.uWipe, done ? Math.min(1, Math.max(0, (doneS - .75) / 1.75)) : 0);
+  gl.uniform1f(u.uAsp, W / H); gl.uniform1f(u.uLod, Math.log2(PW / simW));
+  gl.uniform1f(u.uDt, 3 / SUB);
+  bind(1, textTex, u.uText); bind(2, field.tex, u.uField);
+  for (let i = 0; i < SUB; i++) {
+    bind(0, simA.tex, u.uS);
+    quad(simB);
+    [simA, simB] = [simB, simA];
+  }
+}
+
+function tick() {
+  const dt = 1 / 60; t += dt;
+  const want = PLAY ? SCRIPT.some(([a, b]) => t >= a && t < b) : pressed;
+  if (done) held = false;
+  else {
+    if (held && !want) releasedAt = t;
+    held = want;
+    if (held) { P += dt / HOLD_S; heldTotal += dt; } else P -= dt / COOL_S;
+    P = Math.min(1, Math.max(0, P));
+    if (P >= 1) { done = true; doneAt = t; holdBtn.style.display = 'none'; }
+  }
+  if (!ended) {
+    simStep();
+    stepEmbers(dt);
+    const left = Math.round(ROWS * Math.pow(1 - P, 1.6));
+    drawLabel(P > 0 ? left.toLocaleString('en-US') + ' ROWS LEFT' : 'HOLD TO DROP DATABASE');
+  }
+  if (done && !ended && t - doneAt > T_TYPE) { ended = true; typed = 0; }
+  if (ended) {
+    const line = `Query OK, 1 career affected (${heldTotal.toFixed(2)} sec)`;
+    const n = Math.min(line.length, Math.floor((t - doneAt - T_TYPE) * 26));
+    const blink = n === line.length && Math.floor(t * 1.6) % 2 === 1, key = n + (blink ? .5 : 0);
+    if (key !== typed) { typed = key; drawEnd(line, n, blink); }
+    if (n === line.length && !CLEAN && again.style.display !== 'block' && t - doneAt > T_TYPE + 2.4) { again.style.display = 'block'; say.textContent = line; }
+  }
+}
+
+function drawEnd(line, n, blink) {
+  tctx.setTransform(1, 0, 0, 1, 0, 0); tctx.fillStyle = '#000'; tctx.fillRect(0, 0, PW, PH);
+  tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const f = Math.min(font * 1.1, (W - 2 * gutter) / (line.length + 2) / .6);
+  tctx.font = `500 ${f}px 'IBM Plex Mono', ui-monospace, Menlo, monospace`;
+  const cw = tctx.measureText('0').width, x = (W - cw * line.length) / 2, y = H * .46;
+  tctx.textBaseline = 'middle'; tctx.fillStyle = COLD; tctx.fillText(line.slice(0, n), x, y);
+  if (!blink) tctx.fillRect(x + cw * n + cw * .1, y - f * .62, cw * .8, f * 1.24);
+  uploadText();
+}
+
+function render() {
+  const doneS = done ? t - doneAt : 0;
+  const line = done && doneS > T_OFF && doneS < T_OFF + .42 ? (doneS - T_OFF) / .42 : 0;
+  const power = !done ? 1 : doneS < T_OFF ? 1 : Math.max(0, 1 - (doneS - T_OFF) / .12);
+
+  gl.bindVertexArray(vao); gl.disable(gl.BLEND);
+  gl.useProgram(P_SCENE.p); let u = P_SCENE.u;
+  gl.uniform2f(u.uRes, PW, PH); gl.uniform2f(u.uSimRes, simW, simH);
+  gl.uniform4f(u.uBtn, btn.x / W, 1 - (btn.y + btn.h) / H, (btn.x + btn.w) / W, 1 - btn.y / H);
+  gl.uniform1f(u.uTime, t); gl.uniform1f(u.uP, P); gl.uniform1f(u.uPower, power); gl.uniform1f(u.uEnd, ended ? 1 : 0);
+  gl.uniform1f(u.uDone, done ? 1 : 0); gl.uniform1f(u.uCalm, CALM); gl.uniform1f(u.uFill, P);
+  bind(0, simA.tex, u.uS); bind(1, textTex, u.uText);
+  quad(scene);
+
+  if (ember.length) {
+    let i = 0;
+    for (const e of ember) { embersBuf[i++] = e.x; embersBuf[i++] = e.y; embersBuf[i++] = e.vx; embersBuf[i++] = e.vy; embersBuf[i++] = e.life * (.82 + .18 * Math.sin(e.ph * 5)); embersBuf[i++] = e.size; }
+    gl.useProgram(P_EMBER.p); gl.uniform2f(P_EMBER.u.uRes, PW, PH);
+    gl.bindVertexArray(evao); gl.bindBuffer(gl.ARRAY_BUFFER, ebo);
+    gl.bufferData(gl.ARRAY_BUFFER, embersBuf.subarray(0, i), gl.DYNAMIC_DRAW);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, scene.fb); gl.viewport(0, 0, PW, PH);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, ember.length);
+    gl.disable(gl.BLEND); gl.bindVertexArray(vao);
+  }
+
+  gl.useProgram(P_BLUR.p); u = P_BLUR.u;
+  let src = scene;
+  chain.forEach((c, i) => {
+    gl.uniform2f(u.uPx, .5 / c.w, .5 / c.h); gl.uniform1f(u.uKnee, i ? 0 : 1.6);
+    bind(0, src.tex, u.uT); quad(c); src = c;
+  });
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  for (let i = chain.length - 1; i > 0; i--) {
+    gl.uniform2f(u.uPx, 1 / chain[i].w, 1 / chain[i].h); gl.uniform1f(u.uKnee, 0); // a full texel: half a texel leaves the wide levels blocky on black
+    bind(0, chain[i].tex, u.uT); quad(chain[i - 1]);
+  }
+  gl.disable(gl.BLEND);
+
+  gl.useProgram(P_FINAL.p); u = P_FINAL.u;
+  gl.uniform2f(u.uRes, PW, PH); gl.uniform1f(u.uTime, t); gl.uniform1f(u.uPower, power); gl.uniform1f(u.uLine, line); gl.uniform1f(u.uCalm, CALM); gl.uniform1f(u.uDpr, dpr);
+  bind(0, scene.tex, u.uScene); bind(1, chain[0].tex, u.uBloom);
+  quad(null);
+
+  if (PLAY) moveCursor();
+}
+
+// ?play's visible pointer: rests beside the button, sits on it while the script holds
+function moveCursor() {
+  const on = SCRIPT.reduce((m, [a, b]) => Math.max(m, Math.min(1, Math.max(0, Math.min((t - a + .14) / .14, (b + .3 - t) / .3)))), 0);
+  const k = on * on * (3 - 2 * on), gone = done && t - doneAt > 1.5 ? 0 : 1;
+  const x = btn.x + btn.w * .9 + (1 - k) * 30, y = btn.y + btn.h * .5 - (1 - k) * 34;
+  cur.style.display = gone ? 'block' : 'none';
+  cur.style.transform = `translate(${x}px, ${y}px) scale(${held ? .9 : 1})`;
+}
+
+/* ---------- input: mouse, touch and keyboard all set one flag ---------- */
+let pressed = false;
+const press = () => { if (!PLAY && !done) pressed = true; }, letGo = () => { pressed = false; };
+holdBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); holdBtn.setPointerCapture(e.pointerId); press(); });
+for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture']) holdBtn.addEventListener(ev, letGo);
+holdBtn.addEventListener('contextmenu', (e) => e.preventDefault()); // long-press menu on phones would cancel the hold
+const holdKey = (e) => (e.key === ' ' || e.key === 'Enter') && (document.activeElement === holdBtn || document.activeElement === document.body);
+addEventListener('keydown', (e) => { if (holdKey(e)) { e.preventDefault(); if (!e.repeat) press(); } });
+addEventListener('keyup', (e) => { if (e.key === ' ' || e.key === 'Enter') letGo(); });
+addEventListener('blur', letGo);
+document.addEventListener('visibilitychange', letGo);
+again.addEventListener('click', () => { reset(); holdBtn.focus({ preventScroll: true }); });
+addEventListener('resize', () => { if (innerWidth !== W || innerHeight !== H) { setup(); if (FREEZE !== null) { run(FREEZE); render(); } } });
+
+/* ---------- clock: fixed 60 Hz steps, so ?t= replays the same melt ---------- */
+function run(to) { while (t + 1 / 60 <= to) tick(); }
+let clock0, last;
+function frame(now) {
+  if (PLAY) run((now - clock0) / 1000);
+  else { const n = Math.min(4, Math.floor((now - last) * .06)); last += n / .06; if (now - last > 100) last = now; for (let i = 0; i < n; i++) tick(); }
+  render();
+  requestAnimationFrame(frame);
+}
+(document.fonts ? document.fonts.load("500 16px 'IBM Plex Mono'").catch(() => {}) : Promise.resolve()).then(() => {
+  setup();
+  window.__peek = () => ({ P, held, done, t, heldTotal }); // read by check.mjs
+  if (FREEZE !== null) { run(FREEZE); render(); window.__ready = true; return; }
+  clock0 = last = performance.now();
+  window.__ready = true;
+  requestAnimationFrame(frame);
+});
+</script>
+</body>
+</html>
